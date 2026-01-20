@@ -6,8 +6,7 @@
     "dev": "concurrently \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
     "build": "npm --prefix server run build && npm --prefix client run build",
     "start": "npm --prefix server run start",
-    "install:all": "npm --prefix server install && npm --prefix client install",
-    "postinstall": "npm run install:all"
+    "install:all": "npm --prefix server install && npm --prefix client install"
   },
   "keywords": [],
   "author": "",
