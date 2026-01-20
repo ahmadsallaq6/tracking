@@ -4,6 +4,8 @@
   "outputDirectory": "client/dist",
   "installCommand": "npm install && cd client && npm install",
   "rewrites": [
-    { "source": "/(.*)", "destination": "/index.html" }
+    { "source": "/api/chat", "destination": "/api/chat" },
+    { "source": "/api/health", "destination": "/api/health" },
+    { "source": "/:path((?!api/).*)", "destination": "/index.html" }
   ]
 }
