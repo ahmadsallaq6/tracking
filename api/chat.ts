@@ -37,6 +37,15 @@ type TradeLogConfig = {
   };
 };
 
+type ToolStatus = "used" | "attempted" | "not_configured" | "error" | "skipped";
+
+type ToolUsage = {
+  linkup: {
+    status: ToolStatus;
+    results: number;
+  };
+};
+
 // ============ Config ============
 const config: TradeLogConfig = {
   sheetName: "Trade Log",
@@ -103,6 +112,74 @@ async function getHeaderIndex(context: SheetsContext, spreadsheetId: string, cfg
   return index;
 }
 
+async function getSheetProperties(
+  context: SheetsContext,
+  spreadsheetId: string,
+  sheetName: string
+): Promise<{ sheetId: number; rowCount: number; columnCount: number }> {
+  const response = await context.sheets.spreadsheets.get({
+    spreadsheetId,
+    fields: "sheets.properties(sheetId,title,gridProperties(rowCount,columnCount))",
+  });
+
+  const sheet = response.data.sheets?.find(
+    (entry) => entry.properties?.title === sheetName
+  );
+  const properties = sheet?.properties;
+  const grid = properties?.gridProperties;
+
+  if (!properties?.sheetId || !grid) {
+    throw new Error(`Sheet '${sheetName}' not found in spreadsheet ${spreadsheetId}.`);
+  }
+
+  return {
+    sheetId: properties.sheetId,
+    rowCount: grid.rowCount ?? 0,
+    columnCount: grid.columnCount ?? 0,
+  };
+}
+
+async function ensureSheetCapacity(
+  context: SheetsContext,
+  spreadsheetId: string,
+  sheetName: string,
+  minRows: number,
+  minColumns: number
+): Promise<void> {
+  const { sheetId, rowCount, columnCount } = await getSheetProperties(
+    context,
+    spreadsheetId,
+    sheetName
+  );
+
+  const targetRows = Math.max(rowCount, minRows + 10); // Add buffer
+  const targetColumns = Math.max(columnCount, minColumns);
+
+  if (targetRows === rowCount && targetColumns === columnCount) {
+    return;
+  }
+
+  await context.sheets.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [
+        {
+          updateSheetProperties: {
+            properties: {
+              sheetId,
+              gridProperties: {
+                rowCount: targetRows,
+                columnCount: targetColumns,
+              },
+            },
+            fields: "gridProperties(rowCount,columnCount)",
+          },
+        },
+      ],
+    },
+  });
+}
+
 function buildRow(trade: TradeInput, headerIndex: HeaderIndex, cfg: TradeLogConfig): string[] {
   const normalizedType = normalizeTransactionType(trade.transactionType);
   const totalAmount = Number.isFinite(trade.totalAmount) && trade.totalAmount !== 0
@@ -154,6 +231,15 @@ async function appendTradeRow(trade: TradeInput, cfg: TradeLogConfig): Promise<v
   );
   const targetRow = dataStartRow + (firstEmptyIndex === -1 ? rows.length : firstEmptyIndex);
 
+  // Ensure sheet has enough rows before writing
+  await ensureSheetCapacity(
+    context,
+    spreadsheetId,
+    cfg.sheetName,
+    targetRow,
+    row.length
+  );
+
   await context.sheets.spreadsheets.values.update({
     spreadsheetId,
     range: `${cfg.sheetName}!A${targetRow}`,
@@ -180,6 +266,65 @@ async function readTrades(cfg: TradeLogConfig): Promise<Record<string, string>[]
     headers.forEach(([header, idx]) => { entry[header] = row[idx] ? String(row[idx]) : ""; });
     return entry;
   });
+}
+
+// ============ Linkup Search ============
+type LinkupSearchResult = {
+  name?: string;
+  url?: string;
+  content?: string;
+};
+
+type LinkupSearchResponse = {
+  results?: LinkupSearchResult[];
+};
+
+type LinkupSearchOutcome = {
+  status: "not_configured" | "error" | "ok";
+  payload?: LinkupSearchResponse;
+};
+
+function shouldUseWebSearch(message: string): boolean {
+  const text = message.toLowerCase();
+  return (
+    text.includes("price") ||
+    text.includes("quote") ||
+    text.includes("stock price") ||
+    text.includes("current price") ||
+    text.includes("market price")
+  );
+}
+
+async function fetchLinkupSearch(query: string): Promise<LinkupSearchOutcome> {
+  const apiKey = process.env.LINKUP_API_KEY?.trim();
+  if (!apiKey) {
+    return { status: "not_configured" };
+  }
+
+  try {
+    const response = await fetch("https://api.linkup.so/v1/search", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        q: query,
+        depth: "standard",
+        outputType: "searchResults",
+        maxResults: 5,
+      }),
+    });
+
+    if (!response.ok) {
+      return { status: "error" };
+    }
+
+    const payload = (await response.json()) as LinkupSearchResponse;
+    return { status: "ok", payload };
+  } catch {
+    return { status: "error" };
+  }
 }
 
 // ============ Agent ============
@@ -218,6 +363,7 @@ Rules:
 
 const replySystemPrompt = `You are a helpful trading assistant. Respond naturally to the user.
 If context JSON is provided, use it to craft a helpful response.
+If web search results are provided, use them for up-to-date info and cite the URL in parentheses.
 If action is "summarize", explain the summary in plain language.
 If action is "log_trade", confirm what was logged.
 If action is "unknown", ask a brief clarifying question.
@@ -267,14 +413,38 @@ async function interpretMessage(message: string, history?: ChatMessage[]) {
   return parsed.data as { action: "log_trade" | "summarize" | "unknown"; trade?: TradeInput | null; summary?: SummaryQuery | null; };
 }
 
-async function generateReply(message: string, context?: { action?: string; trade?: TradeInput | null; summary?: SummaryQuery | null; summaryText?: string | null; error?: string | null; }, history?: ChatMessage[]): Promise<string> {
+async function generateReply(
+  message: string,
+  context: { action?: string; trade?: TradeInput | null; summary?: SummaryQuery | null; summaryText?: string | null; error?: string | null; },
+  history: ChatMessage[] | undefined,
+  tools: ToolUsage
+): Promise<{ reply: string; tools: ToolUsage }> {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
   const client = new OpenAI({ apiKey });
+  
+  // Try web search if applicable
+  let webSearchPayload: string | null = null;
+  if (shouldUseWebSearch(message)) {
+    const search = await fetchLinkupSearch(message);
+    if (search.status === "not_configured") {
+      tools.linkup.status = "not_configured";
+    } else if (search.status === "error") {
+      tools.linkup.status = "error";
+    } else {
+      const results = search.payload?.results ?? [];
+      tools.linkup.results = results.length;
+      tools.linkup.status = results.length ? "used" : "attempted";
+      if (results.length) {
+        webSearchPayload = JSON.stringify(search.payload);
+      }
+    }
+  }
+
   const payload = context ? JSON.stringify(context) : "";
   const historyText = formatHistory(history);
-  const prompt = `${replySystemPrompt}\nConversation:\n${historyText}\nContext JSON: ${payload}\nUser message: ${message}`;
+  const prompt = `${replySystemPrompt}\nConversation:\n${historyText}\nContext JSON: ${payload}\nWeb search JSON: ${webSearchPayload ?? ""}\nUser message: ${message}`;
   
   const result = await client.chat.completions.create({
     model: process.env.OPENAI_MODEL || "gpt-4o-mini",
@@ -285,7 +455,10 @@ async function generateReply(message: string, context?: { action?: string; trade
     temperature: 0.4,
   });
   
-  return result.choices[0]?.message?.content?.trim() ?? "";
+  return {
+    reply: result.choices[0]?.message?.content?.trim() ?? "",
+    tools,
+  };
 }
 
 // ============ Helpers ============
@@ -361,6 +534,10 @@ function pushHistory(entry: ChatMessage) {
   if (chatHistory.length > MAX_HISTORY) chatHistory.splice(0, chatHistory.length - MAX_HISTORY);
 }
 
+const defaultTools: ToolUsage = {
+  linkup: { status: "skipped", results: 0 },
+};
+
 // ============ Handler ============
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Handle CORS
@@ -377,35 +554,51 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   const message = String(req.body?.message ?? "").trim();
-  if (!message) return res.status(400).json({ reply: "Message is required." });
+  if (!message) return res.status(400).json({ reply: "Message is required.", tools: defaultTools });
 
   try {
     const action = await interpretMessage(message, chatHistory);
+    const tools: ToolUsage = { linkup: { status: "skipped", results: 0 } };
 
     if (action.action === "log_trade" && action.trade) {
       await appendTradeRow(action.trade, config);
-      const reply = await generateReply(message, { action: "log_trade", trade: action.trade }, chatHistory);
+      const { reply, tools: updatedTools } = await generateReply(
+        message,
+        { action: "log_trade", trade: action.trade },
+        chatHistory,
+        tools
+      );
       pushHistory({ role: "user", content: message });
       pushHistory({ role: "assistant", content: reply });
-      return res.json({ reply });
+      return res.json({ reply, tools: updatedTools });
     }
 
     if (action.action === "summarize") {
       const trades = await readTrades(config);
       const summary = summarizeTrades(trades, action.summary ?? {});
-      const reply = await generateReply(message, { action: "summarize", summary: action.summary ?? {}, summaryText: summary }, chatHistory);
+      const { reply, tools: updatedTools } = await generateReply(
+        message,
+        { action: "summarize", summary: action.summary ?? {}, summaryText: summary },
+        chatHistory,
+        tools
+      );
       pushHistory({ role: "user", content: message });
       pushHistory({ role: "assistant", content: reply });
-      return res.json({ reply });
+      return res.json({ reply, tools: updatedTools });
     }
 
-    const reply = await generateReply(message, { action: "unknown" }, chatHistory);
+    const { reply, tools: updatedTools } = await generateReply(
+      message,
+      { action: "unknown" },
+      chatHistory,
+      tools
+    );
     pushHistory({ role: "user", content: message });
     pushHistory({ role: "assistant", content: reply });
-    return res.json({ reply });
+    return res.json({ reply, tools: updatedTools });
   } catch (error) {
     console.error(error);
     const errorMessage = error instanceof Error ? error.message : "Unexpected server error.";
-    return res.status(500).json({ reply: errorMessage });
+    return res.status(500).json({ reply: errorMessage, tools: defaultTools });
   }
 }
