@@ -107,9 +107,32 @@ async function getHeaderIndex(context: SheetsContext, spreadsheetId: string, cfg
   const headers = response.data.values?.[0] ?? [];
   const index: HeaderIndex = {};
   headers.forEach((header: unknown, i: number) => {
-    if (typeof header === "string" && header.trim()) index[header.trim()] = i;
+    if (typeof header === "string" && header.trim()) {
+      // Store both the original and normalized version for flexible matching
+      const trimmed = header.trim();
+      index[trimmed] = i;
+      // Also store lowercase version for case-insensitive lookup
+      index[trimmed.toLowerCase()] = i;
+    }
   });
   return index;
+}
+
+// Helper to find header index with flexible matching
+function findHeaderIndex(headerIndex: HeaderIndex, headerName: string | undefined): number | undefined {
+  if (!headerName) return undefined;
+  // Try exact match first
+  if (headerIndex[headerName] !== undefined) return headerIndex[headerName];
+  // Try lowercase match
+  if (headerIndex[headerName.toLowerCase()] !== undefined) return headerIndex[headerName.toLowerCase()];
+  // Try partial match (header contains the key word)
+  const lowerName = headerName.toLowerCase();
+  for (const [key, idx] of Object.entries(headerIndex)) {
+    if (key.toLowerCase().includes(lowerName) || lowerName.includes(key.toLowerCase())) {
+      return idx;
+    }
+  }
+  return undefined;
 }
 
 async function getSheetProperties(
@@ -197,7 +220,7 @@ function buildRow(trade: TradeInput, headerIndex: HeaderIndex, cfg: TradeLogConf
   ];
 
   const indices = entries
-    .map(([header]) => (header ? headerIndex[header] : undefined))
+    .map(([header]) => findHeaderIndex(headerIndex, header))
     .filter((value): value is number => typeof value === "number");
 
   if (!indices.length) throw new Error("No matching headers found. Check column names.");
@@ -206,7 +229,7 @@ function buildRow(trade: TradeInput, headerIndex: HeaderIndex, cfg: TradeLogConf
 
   entries.forEach(([header, value]) => {
     if (!header) return;
-    const idx = headerIndex[header];
+    const idx = findHeaderIndex(headerIndex, header);
     if (typeof idx === "number") row[idx] = value === null || value === undefined ? "" : String(value);
   });
 
@@ -474,6 +497,21 @@ function parseDate(value: string | null | undefined): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+// Helper to find value in row with flexible key matching
+function getRowValue(row: Record<string, string>, key: string | undefined): string {
+  if (!key) return "";
+  // Try exact match first
+  if (row[key] !== undefined) return row[key];
+  // Try case-insensitive match
+  const lowerKey = key.toLowerCase();
+  for (const [k, v] of Object.entries(row)) {
+    if (k.toLowerCase() === lowerKey) return v;
+    // Try partial match
+    if (k.toLowerCase().includes(lowerKey) || lowerKey.includes(k.toLowerCase())) return v;
+  }
+  return "";
+}
+
 function summarizeTrades(rows: Record<string, string>[], query: SummaryQuery) {
   const symbolKey = config.columns.symbol!;
   const typeKey = config.columns.transactionType!;
@@ -486,11 +524,11 @@ function summarizeTrades(rows: Record<string, string>[], query: SummaryQuery) {
     const hasValues = Object.values(row).some((value) => String(value ?? "").trim());
     if (!hasValues) return false;
     if (query.symbol) {
-      const symbol = (row[symbolKey] ?? "").toUpperCase();
+      const symbol = getRowValue(row, symbolKey).toUpperCase();
       if (symbol !== query.symbol.toUpperCase()) return false;
     }
     if (dateKey && (query.startDate || query.endDate)) {
-      const rowDate = parseDate(row[dateKey]);
+      const rowDate = parseDate(getRowValue(row, dateKey));
       if (!rowDate) return false;
       const start = parseDate(query.startDate);
       const end = parseDate(query.endDate);
@@ -505,11 +543,11 @@ function summarizeTrades(rows: Record<string, string>[], query: SummaryQuery) {
   const summary = new Map<string, { buyQty: number; buyValue: number; sellQty: number; sellValue: number; }>();
 
   filtered.forEach((row) => {
-    const symbol = (row[symbolKey] ?? "UNKNOWN").toUpperCase();
-    const rawSide = (row[typeKey] ?? "").trim().toLowerCase();
-    const qty = parseMoney(row[qtyKey] ?? "");
-    const amountPerUnit = parseMoney(row[amountKey] ?? "");
-    const totalAmount = parseMoney(row[totalKey] ?? "") || amountPerUnit * qty;
+    const symbol = getRowValue(row, symbolKey).toUpperCase() || "UNKNOWN";
+    const rawSide = getRowValue(row, typeKey).trim().toLowerCase();
+    const qty = parseMoney(getRowValue(row, qtyKey));
+    const amountPerUnit = parseMoney(getRowValue(row, amountKey));
+    const totalAmount = parseMoney(getRowValue(row, totalKey)) || amountPerUnit * qty;
     const entry = summary.get(symbol) ?? { buyQty: 0, buyValue: 0, sellQty: 0, sellValue: 0 };
 
     if (rawSide.startsWith("buy")) { entry.buyQty += qty; entry.buyValue += totalAmount; }
