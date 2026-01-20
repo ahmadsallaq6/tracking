@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
+import type { Request, Response } from "express";
 import {
   ChatMessage,
   ToolUsage,
@@ -297,7 +298,7 @@ function summarizeTrades(rows: Record<string, string>[], query: SummaryQuery) {
   return `Total trades: ${filtered.length}.\n${lines.join("\n")}`;
 }
 
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", async (req: Request, res: Response) => {
   const message = String(req.body?.message ?? "").trim();
   if (!message) {
     return res.status(400).json({ reply: "Message is required." });
@@ -424,13 +425,13 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-app.get("/api/health", (_req, res) => {
+app.get("/api/health", (_req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
 if (fs.existsSync(clientDistPath)) {
   app.use(express.static(clientDistPath));
-  app.get("*", (req, res) => {
+  app.get("*", (req: Request, res: Response) => {
     if (req.path.startsWith("/api/")) {
       res.status(404).json({ error: "Not found" });
       return;
@@ -439,7 +440,13 @@ if (fs.existsSync(clientDistPath)) {
   });
 }
 
-const port = Number(process.env.PORT ?? 4000);
-app.listen(port, () => {
-  console.log(`Server listening on http://localhost:${port}`);
-});
+const isVercel = Boolean(process.env.VERCEL);
+
+if (!isVercel) {
+  const port = Number(process.env.PORT ?? 4000);
+  app.listen(port, () => {
+    console.log(`Server listening on http://localhost:${port}`);
+  });
+}
+
+export default app;

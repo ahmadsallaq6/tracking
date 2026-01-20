@@ -115,7 +115,7 @@ async function getHeaderIndex(
   const headers = response.data.values?.[0] ?? [];
   const index: HeaderIndex = {};
 
-  headers.forEach((header, i) => {
+  headers.forEach((header: unknown, i: number) => {
     if (typeof header === "string" && header.trim()) {
       index[header.trim()] = i;
     }
@@ -371,7 +371,7 @@ export async function readTrades(
   }
   const rows = response.data.values ?? [];
 
-  return rows.map((row) => {
+  return rows.map((row: Array<string | number | null | undefined>) => {
     const entry: Record<string, string> = {};
     headers.forEach(([header, idx]) => {
       entry[header] = row[idx] ? String(row[idx]) : "";
