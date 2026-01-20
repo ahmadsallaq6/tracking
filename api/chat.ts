@@ -40,12 +40,12 @@ type TradeLogConfig = {
 // ============ Config ============
 const config: TradeLogConfig = {
   sheetName: "Trade Log",
-  headerRow: 1,
-  dataStartRow: 2,
+  headerRow: 7,
+  dataStartRow: 8,
   columns: {
-    date: "Date",
+    date: "Date (MM-DD-YYYY)",
     transactionType: "Transaction Type",
-    symbol: "Stock / ETF (symbol)",
+    symbol: "Stock / ETF Symbol",
     quantity: "Quantity of Units",
     amountPerUnit: "Amount per unit",
     totalAmount: "Total Amount (before trading fees)",
